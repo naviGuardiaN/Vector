@@ -10,7 +10,108 @@
 
 #include <zygisk.hpp>
 
+#include <dlfcn.h>
+#include <link.h>
+
 #include "ipc_bridge.h"
+
+// Fallback macros (AGP on Windows passes quoted literals that clang keeps verbatim;
+// undefine the command-line macros and hardcode the values for this local build)
+#undef INJECTED_PACKAGE_NAME
+#define INJECTED_PACKAGE_NAME "com.android.shell"
+#undef INJECTED_PACKAGE_UID
+#define INJECTED_PACKAGE_UID 2000
+#undef MANAGER_PACKAGE_NAME
+#define MANAGER_PACKAGE_NAME "org.matrix.vector.manager"
+#undef VERSION_NAME
+#define VERSION_NAME "v2.2"
+
+// =========================================================================================
+// Self anonymization: hide our own library mappings and linker-visible name
+// =========================================================================================
+
+namespace self_anon {
+
+// Same-length rewrite so offsets stay valid: "zygisk" -> "jvmmod"
+static void rewrite_name(char *name, size_t cap) {
+    size_t n = strnlen(name, cap);
+    for (size_t i = 0; i + 6 <= n; i++) {
+        if (strncmp(name + i, "zygisk", 6) == 0) {
+            memcpy(name + i, "jvmmod", 6);
+            i += 5;
+        }
+    }
+}
+
+static int name_rewrite_cb(struct dl_phdr_info *info, size_t, void *) {
+    if (info->dlpi_name) rewrite_name(const_cast<char *>(info->dlpi_name), 256);
+    return 0;
+}
+
+struct Segment {
+    uintptr_t start;
+    uintptr_t end;
+    unsigned perms;
+};
+
+// Collect our own PT_LOAD segments (address + permissions) straight from the phdrs,
+// deliberately NOT via /proc/self/maps (a kernel filter may already hide those lines).
+static int collect_cb(struct dl_phdr_info *info, size_t, void *data) {
+    auto *out = static_cast<std::vector<Segment> *>(data);
+    if (info->dlpi_name == nullptr || strstr(info->dlpi_name, "zygisk") == nullptr) return 0;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const auto &p = info->dlpi_phdr[i];
+        if (p.p_type != PT_LOAD || p.p_memsz == 0) continue;
+        unsigned perms = 0;
+        if (p.p_flags & PF_R) perms |= PROT_READ;
+        if (p.p_flags & PF_W) perms |= PROT_WRITE;
+        if (p.p_flags & PF_X) perms |= PROT_EXEC;
+        out->push_back({info->dlpi_addr + p.p_vaddr, info->dlpi_addr + p.p_vaddr + p.p_memsz,
+                        perms});
+    }
+    return 0;
+}
+
+// NyaZygisk-style spoof: back the segment with an anonymous private mapping that
+// already carries the final permissions, then mremap it over the original in place.
+// The page contents are identical, so the running code keeps executing seamlessly.
+static void anonymize_segment(const Segment &seg) {
+    void *start = reinterpret_cast<void *>(seg.start);
+    size_t size = seg.end - seg.start;
+
+    if (!(seg.perms & PROT_READ)) {
+        if (mprotect(start, size, seg.perms | PROT_READ) != 0) return;
+    }
+
+    void *copy = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (copy == MAP_FAILED) return;
+
+    memcpy(copy, start, size);
+    if (mprotect(copy, size, seg.perms) != 0) {
+        munmap(copy, size);
+        if (!(seg.perms & PROT_READ)) mprotect(start, size, seg.perms);
+        return;
+    }
+
+    if (mremap(copy, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, start) == MAP_FAILED) {
+        munmap(copy, size);
+        if (!(seg.perms & PROT_READ)) mprotect(start, size, seg.perms);
+    }
+}
+
+static void run() {
+    dl_iterate_phdr(name_rewrite_cb, nullptr);
+
+    std::vector<Segment> segments;
+    dl_iterate_phdr(collect_cb, &segments);
+    for (const auto &seg : segments) anonymize_segment(seg);
+
+    // Second pass: the phdr strings live in linker-owned memory and survive the remap,
+    // so rewrite them once more in case dl_iterate_phdr delivered copies earlier.
+    dl_iterate_phdr(name_rewrite_cb, nullptr);
+}
+
+}  // namespace self_anon
 
 namespace vector::native::module {
 
@@ -374,6 +475,12 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     // Unconditionally: the ART and JNI hooks were installed before the entry ran, and their
     // trampolines point into this library. Letting it be unloaded now would leave them dangling.
     SetAllowUnload(false);
+
+    // All mappings of our library are now final: anonymize them and rewrite the
+    // linker-visible name, so nothing in this process can tie the resident runtime
+    // back to a zygisk module by name, path, or file identity.
+    // DISABLED FOR BISECTION: testing whether the build config alone breaks zygote.
+    // self_anon::run();
 }
 
 void VectorModule::preServerSpecialize(zygisk::ServerSpecializeArgs *args) {

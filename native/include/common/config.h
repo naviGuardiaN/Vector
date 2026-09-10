@@ -46,6 +46,9 @@ inline constexpr auto kLinkerPath = "/linker";
 const int kVersionCode = VERSION_CODE;
 
 /// The version name of the library, populated by the build system.
+/// (AGP on Windows passes VERSION_NAME as a quoted literal; undefine and hardcode.)
+#undef VERSION_NAME
+#define VERSION_NAME "v2.2"
 const char *const kVersionName = VERSION_NAME;
 
 }  // namespace vector::native
