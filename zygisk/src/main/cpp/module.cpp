@@ -478,9 +478,10 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
 
     // All mappings of our library are now final: anonymize them and rewrite the
     // linker-visible name, so nothing in this process can tie the resident runtime
-    // back to a zygisk module by name, path, or file identity.
-    // DISABLED FOR BISECTION: testing whether the build config alone breaks zygote.
-    // self_anon::run();
+    // back to a zygisk module by name, path, or file identity. This also covers the
+    // NyaZygisk memfd mapping of our entry library: its dlpi_name carries "zygisk",
+    // so collect_cb picks it up and the remap turns the named memfd VMA anonymous.
+    self_anon::run();
 }
 
 void VectorModule::preServerSpecialize(zygisk::ServerSpecializeArgs *args) {
